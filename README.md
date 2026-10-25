@@ -318,7 +318,7 @@ The following recipients are configured:
 
 ### Internal subcommands
 
-`git-agecrypt clean`, `smudge`, and `textconv` are invoked by git itself via the filter wiring set up by `init`. You should not need to call them directly. They are hidden from `--help` to keep the user-facing CLI small.
+`git-agecrypt clean`, `smudge`, `process` and `textconv` are invoked by git itself via the filter wiring set up by `init` (or `on`, which wires the single-process `process` filter). You should not need to call them directly. They are hidden from `--help` to keep the user-facing CLI small.
 
 ## Common workflows
 
@@ -430,6 +430,107 @@ $ git-agecrypt deinit
 
 This removes the filter wiring from `.git/config` and clears the local `.git/git-agecrypt/` cache. Tracked files (`.gitattributes`, `git-agecrypt.toml`) are not modified — delete them by hand if you want to fully un-encrypt the repo.
 
+## Per-worktree unlock and signed policy
+
+`init` writes the shared `.git/config`, so every worktree of a clone decrypts.
+`on` unlocks only the worktree it runs in, behind a signed policy:
+
+```console
+$ git config git-agecrypt.config.identityCommand "op read op://vault/age-key/password"
+$ git-agecrypt config add --name alice -r age1… -p 'secrets/2026/**'
+$ git-agecrypt sign      # owner: bump [policy], sign with your git SSH key
+$ git-agecrypt verify    # check the signature, change nothing
+$ git-agecrypt on        # verify, pin, unlock this worktree
+$ git-agecrypt off       # lock it again, drop the cache
+```
+
+The whole policy is `git-agecrypt.toml` plus `.gitattributes`:
+
+```toml
+[keys]
+alice = ["age1pq1…", "age1pq1…"]   # a name for one key or several
+bob = "age1pq1…"
+
+[config]
+"secrets/2026/**" = ["alice", "bob"]   # names or recipients
+
+[policy]                  # written by sign: repo id and counter
+id = "…"
+version = 3
+
+[signature]               # written by sign, always last
+ssh = """
+-----BEGIN SSH SIGNATURE-----
+…
+-----END SSH SIGNATURE-----
+"""
+```
+
+- **Identities, once per git command.** `identityCommand` prints an age identity
+  file (a secret-manager read, `cat`, …). `on` wires the long-running filter
+  (`filter.git-agecrypt.process`), so one process serves a whole checkout and
+  the command runs once, not once per file. Post-quantum
+  `AGE-SECRET-KEY-PQ-1` identities go through `age-plugin-pq` until the age
+  crate supports them.
+- **Key names.** `[keys]` names a key or a person's keys; `config` lists
+  names or recipients. An unknown name fails, never encrypts to fewer people.
+  `config add --name` and `config remove` edit the file in place (comments
+  and `[policy]` survive) and drop the now stale `[signature]`. `sign`
+  refuses a ring mixing `age1pq1` and classic recipients.
+- **Signed policy.** `.gitattributes` and everything in `git-agecrypt.toml`
+  above `[signature]` (including `[policy]`, a repo id and a counter) are
+  signed (`ssh-keygen -Y`, namespace `git-agecrypt-policy`). `[signature]`
+  must close the file: anything after it would be unsigned, so it is refused.
+  `on` and `verify` check against `~/.config/git-agecrypt/allowed_signers`,
+  the home taken from the account database rather than `$HOME`. The clone
+  keeps the repo id and highest version it accepted in
+  `<common gitdir>/git-agecrypt-policy.toml`: an older signed policy
+  (rollback) and another repo's (foreign id) are refused by both. The first
+  `on` of a clone trusts the newest policy it is shown (trust on first use).
+  While unlocked, clean refuses to encrypt once the policy differs from the pin.
+- **Rings are whole directories.** Every ring pattern is `<dir>/**` and the toml
+  keys are exactly those patterns, so every file type inside a ring is encrypted.
+  `on` copies the ring lines into `.git/info/attributes`, which outranks any
+  in-tree `.gitattributes`.
+- **Fail closed everywhere else.** The shared config holds the process filter
+  and the commit hook for every worktree of the clone. Without a pin the filter
+  is locked: ciphertext passes through, plaintext is never staged into a ring.
+  The pin lives in `<gitdir>/git-agecrypt.gitconfig`, pulled in by an exact
+  (escaped) `includeIf.gitdir`: a child worktree, another worktree, or the same
+  repo moved elsewhere falls back to locked. `on` in a moved repo re-pins it.
+  `git worktree move` keeps the pin (the worktree's admin dir does not move).
+  A copied repo keeps its plaintext files and `git status` fails there until
+  `on` or `off`. Locked, ciphertext passes only as a blob git already holds,
+  so a forged age header in front of plaintext is refused; unlocked, it must
+  also open with a key here.
+  `on` replaces an `init` unlock, and writes the canonical path of a binary
+  that must live outside the repo.
+- **Commit gate.** `check --staged`, the `pre-commit` and `pre-merge-commit`
+  hook in every worktree: no plaintext under a ring (ciphertext means a whole
+  age header that parses), no symlink, type change or nested `.gitattributes`
+  inside one, no plaintext where HEAD held ciphertext (a dropped ring), no
+  exact copy of a file this worktree decrypted outside the rings, no policy
+  drift. Submodule entries are skipped. `check <paths>` serves hook runners
+  and CI. Paths travel through stdin, never argv. Needs a git that runs
+  config-based hooks (`git hook list`): tested with 2.56, not in Debian 12's 2.39.
+- **Refresh.** `on` and `off` make stat stale and re-check-out, never delete;
+  if `on` fails halfway (a blob no identity opens) the worktree goes back to
+  locked with ciphertext everywhere. A re-pin turns files of a dropped ring
+  back into ciphertext.
+- **Rekey.** The cache records each file's recipients (from vlaci/git-agecrypt
+  0.6), so a file this worktree encrypted re-encrypts when its recipients
+  change. Unchanged files, and every file in a fresh clone, keep their old
+  ciphertext until `rekey [paths]` (which needs an unlocked worktree after
+  `on`); `sign` names the rings whose recipients changed.
+
+Limits: `--no-verify` skips the hook, and plumbing such as `commit-tree`
+plus `update-ref` writes commits without it. Any process running as you can
+read an unlocked worktree, or run the `identityCommand` (or `textconv`)
+itself from a locked one. A key holder can always decrypt with plain `age`. Diffs
+(`textconv`) run one process per blob, so the identityCommand runs per blob
+there; never set `diff.git-agecrypt.cachetextconv`, which would store
+plaintext in shared refs.
+
 ## How it works
 
 `git-agecrypt` plugs into git's [smudge / clean / textconv filter mechanism](https://git-scm.com/book/en/v2/Customizing-Git-Git-Attributes). After `init`, the repo's `.git/config` contains:
@@ -449,6 +550,9 @@ Git invokes these driver commands per file when `.gitattributes` opts the path i
 - **`smudge`** runs on `git checkout`. Ciphertext from the index is read on stdin; plaintext is written into the working tree.
 - **`textconv`** runs on `git diff` / `git log -p`. The encrypted file is decrypted on the fly so diffs show plaintext.
 
+`on` wires `process` instead of `clean` and `smudge`: git's long-running
+filter protocol, one process per git command.
+
 ### Stable ciphertext via the cache
 
 Age encryption is non-deterministic: the same plaintext encrypted twice produces two different ciphertexts. Without mitigation, every `git status` / `git add` would create a fresh encrypted blob and show every encrypted file as modified. To avoid this, `clean` keeps one cache entry per encrypted path under `.git/git-agecrypt/v2/` (named by the blake3 hash of the path, from vlaci/git-agecrypt 0.6): the blake3 hash of the last plaintext, a fingerprint of the recipients, and the ciphertext.
@@ -464,12 +568,15 @@ When `clean` sees the same plaintext for the same recipients, it emits the cache
 | `.git/config` (filter wiring) | absolute path to the binary | No |
 | `.git/config` (`[git-agecrypt "config"] identity`, `identityCommand`) | paths to *your* private keys, or commands that print them | No |
 | `.git/git-agecrypt/v2/*` (per worktree) | per-file ciphertext, plaintext hash, recipients | No |
+| `<gitdir>/git-agecrypt.gitconfig` (after `on`) | this worktree's pin | No |
+| `.git/info/attributes` (after `on`) | the signed ring lines | No |
+| `<common gitdir>/git-agecrypt-policy.toml` | the accepted repo id and version | No |
 
 Encryption never needs the private key, so `git-agecrypt config add -r` works on a fresh clone before any identity is configured. Decryption of course does — that's what `config add -i` is for.
 
 ## Limitations
 
-- The binary is re-executed once per file per git operation. Repos with thousands of encrypted files will see noticeable overhead. Implementing git's [long-running filter protocol](https://git.kernel.org/pub/scm/git/git.git/tree/Documentation/technical/long-running-process-protocol.txt) would amortize this, but isn't done yet.
+- After `init`, the binary is re-executed once per file per git operation. `on` uses git's [long-running filter protocol](https://git.kernel.org/pub/scm/git/git.git/tree/Documentation/technical/long-running-process-protocol.txt) instead: one process per git command.
 - During encrypt / decrypt the whole file is loaded into memory. Don't use this for files that don't fit in RAM.
 - Filters apply to files, not directories. Use `secrets/**`, not `secrets/`, in `.gitattributes`.
 - Removing a recipient does not rewrite git history — old commits remain decryptable by the previous keys. Treat key revocation as a prompt to also rotate the underlying secrets.

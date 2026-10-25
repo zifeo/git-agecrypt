@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::{Context as _, Result, anyhow, bail};
 
 use super::internal::CommandContext;
-use crate::ctx::Context;
+use crate::{age::MAGIC, ctx::Context, git::Repository};
 
 /// Largest pkt-line payload: 65520 bytes minus the 4-byte length header.
 const MAX_PAYLOAD: usize = 65516;
@@ -106,8 +106,21 @@ fn handshake(r: &mut impl Read, w: &mut impl Write) -> Result<()> {
     Ok(w.flush()?)
 }
 
-/// Serve requests until git closes the pipe.
+/// Locked mode: plaintext can never enter the index, whether the unlock is
+/// missing, moved with the repo, or belongs to another worktree. Ciphertext
+/// passes only as a blob git already holds (what checkout wrote): new content
+/// behind an age header could be plaintext dressed up.
+fn locked_clean(repo: &impl Repository, path: &str, content: Vec<u8>) -> Result<Vec<u8>> {
+    if content.starts_with(MAGIC) && repo.has_blob(&content)? {
+        return Ok(content);
+    }
+    bail!("{path}: new content in a ring, but this worktree is locked: git-agecrypt on first")
+}
+
+/// Every worktree of the clone runs this (shared `.git/config`). Only one
+/// whose own include pins a policy decrypts; the rest stay locked.
 pub(crate) fn serve<C: Context>(cmd: &CommandContext<C>) -> Result<()> {
+    let locked = cmd.ctx.pinned_policy()?.is_none();
     let mut r = BufReader::new(io::stdin().lock());
     let mut w = BufWriter::new(io::stdout().lock());
     handshake(&mut r, &mut w)?;
@@ -121,10 +134,13 @@ pub(crate) fn serve<C: Context>(cmd: &CommandContext<C>) -> Result<()> {
         let command = get("command").context("filter request without command")?;
         let path = get("pathname").context("filter request without pathname")?;
         let content = read_content(&mut r)?;
-        let result = match command.as_str() {
-            "clean" => cmd.clean_bytes(Path::new(&path), content),
-            "smudge" => cmd.smudge_bytes(Path::new(&path), content),
-            other => Err(anyhow!("unsupported filter command {other}")),
+        let result = match (command.as_str(), locked) {
+            ("clean", false) => cmd.clean_bytes(Path::new(&path), content),
+            ("smudge", false) => cmd.smudge_bytes(Path::new(&path), content),
+            ("clean", true) => locked_clean(cmd.ctx.repo(), &path, content),
+            // Locked: the working tree holds exactly what the index holds.
+            ("smudge", true) => Ok(content),
+            (other, _) => Err(anyhow!("unsupported filter command {other}")),
         };
         match result {
             Ok(out) => {

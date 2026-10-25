@@ -26,6 +26,9 @@ const SIG_HEADER: &str = "[signature]";
 /// ssh-keygen -Y namespace: a policy signature is never valid for a commit or tag.
 const NAMESPACE: &str = "git-agecrypt-policy";
 const FILTER_ATTR: &str = "filter=git-agecrypt";
+/// Highest accepted policy per clone, in the common git dir: it moves with
+/// the clone, and no commit can write it.
+const STATE_FILE: &str = "git-agecrypt-policy.toml";
 
 /// `[policy]`: a repo id signed with the policy (so one repo's signed policy
 /// is never accepted for another) and a counter.
@@ -63,6 +66,10 @@ impl Policy {
         })
     }
 
+    pub(crate) fn digest(&self) -> String {
+        blake3::hash(&self.message).to_hex().to_string()
+    }
+
     fn versioned(&self) -> Result<&Version> {
         self.version.as_ref().with_context(|| {
             format!(
@@ -75,13 +82,18 @@ impl Policy {
         Ok(self.versioned()?.version)
     }
 
-    fn ring_lines(&self) -> Vec<String> {
+    pub(crate) fn ring_lines(&self) -> Vec<String> {
         lines_with_filter(&self.gitattributes)
     }
 
-    fn ring_dirs(&self) -> Result<Vec<String>> {
+    pub(crate) fn ring_dirs(&self) -> Result<Vec<String>> {
         validate_rings(&self.ring_lines(), &self.signed)
     }
+}
+
+/// Digest of the policy as it is on disk now (clean and check compare it to the pin).
+pub(crate) fn digest(root: &Path) -> Result<String> {
+    Ok(Policy::read(root)?.digest())
 }
 
 fn message(gitattributes: &str, signed_toml: &str) -> Vec<u8> {
@@ -179,6 +191,21 @@ fn validate_rings(lines: &[String], toml: &str) -> Result<Vec<String>> {
         .iter()
         .map(|p| p.trim_end_matches('*').to_owned())
         .collect())
+}
+
+/// Ring directories for `check`, which also runs on branches that predate the
+/// policy: no .gitattributes or no ring line means no ring.
+pub(crate) fn ring_dirs_if_any(root: &Path) -> Result<Vec<String>> {
+    let Ok(gitattributes) = fs::read_to_string(root.join(".gitattributes")) else {
+        return Ok(vec![]);
+    };
+    let lines = lines_with_filter(&gitattributes);
+    if lines.is_empty() {
+        return Ok(vec![]);
+    }
+    let toml = fs::read_to_string(root.join(TOML_FILE))
+        .with_context(|| format!("rings in .gitattributes but no {TOML_FILE}"))?;
+    validate_rings(&lines, &toml)
 }
 
 /// Recipients per ring with key names resolved. A ring mixing classic and
@@ -404,4 +431,69 @@ pub(crate) fn verify(trust: &Path, policy: &Policy) -> Result<String> {
         }
         Ok(principal.to_owned())
     })
+}
+
+#[derive(Serialize, Deserialize)]
+struct Accepted {
+    id: String,
+    version: u64,
+    digest: String,
+}
+
+/// Refuse a rollback and a foreign policy, and record what `on` accepted:
+/// this clone keeps the repo id and the highest version it accepted. The first
+/// `on` trusts what it finds.
+pub(crate) fn accept(root: &Path, policy: &Policy) -> Result<()> {
+    let (state_path, current) = checked_state(root, policy)?;
+    let tmp = state_path.with_extension(format!("tmp{}", std::process::id()));
+    fs::write(&tmp, toml::to_string(&current)?)?;
+    fs::rename(&tmp, &state_path)?;
+    Ok(())
+}
+
+/// The same refusals as `accept`, recording nothing (`verify`).
+pub(crate) fn check_accepted(root: &Path, policy: &Policy) -> Result<()> {
+    checked_state(root, policy).map(|_| ())
+}
+
+fn checked_state(root: &Path, policy: &Policy) -> Result<(PathBuf, Accepted)> {
+    let common = gitcli::run(root, &["rev-parse", "--git-common-dir"])?;
+    let common = root.join(common.trim());
+    let state_path = common.join(STATE_FILE);
+    let version = policy.versioned()?;
+    let current = Accepted {
+        id: version.id.clone(),
+        version: version.version,
+        digest: policy.digest(),
+    };
+    match fs::read_to_string(&state_path) {
+        Ok(text) => {
+            let seen: Accepted = toml::from_str(&text)?;
+            if seen.id != current.id {
+                bail!(
+                    "this clone accepted policy id {}, not {}: refusing a foreign policy \
+                     (delete {} only to re-trust deliberately)",
+                    seen.id,
+                    current.id,
+                    state_path.display()
+                );
+            }
+            if current.version < seen.version {
+                bail!(
+                    "policy version {} is older than {}, already accepted: rollback",
+                    current.version,
+                    seen.version
+                );
+            }
+            if current.version == seen.version && current.digest != seen.digest {
+                bail!(
+                    "another policy was already accepted as version {}",
+                    current.version
+                );
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok((state_path, current))
 }

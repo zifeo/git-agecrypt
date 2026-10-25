@@ -37,6 +37,26 @@ pub enum PublicCommands {
     /// Remove repository specific configuration
     Deinit,
 
+    /// Verify the signed policy and unlock this worktree only
+    On {
+        /// Directory holding allowed_signers (default: ~/.config/git-agecrypt,
+        /// home from the account database). Accepted versions live in the clone
+        #[arg(long)]
+        trust: Option<PathBuf>,
+    },
+
+    /// Lock this worktree: encrypted files are ciphertext again
+    Off,
+
+    /// Reject plaintext, links and overrides inside rings, and policy drift
+    Check {
+        /// Check the index instead of the given paths (pre-commit hook)
+        #[arg(long)]
+        staged: bool,
+        /// Paths to check (as passed by a hook runner)
+        paths: Vec<PathBuf>,
+    },
+
     /// Bump [policy] in git-agecrypt.toml and sign it with your git SSH signing key
     Sign,
 

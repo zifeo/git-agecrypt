@@ -124,6 +124,13 @@ impl<C: Context> CommandContext<C> {
 /// --renormalize` run clean on every target.
 pub(crate) fn rekey<C: Context>(ctx: &C, paths: Vec<PathBuf>) -> Result<()> {
     let root = ctx.repo().workdir().to_path_buf();
+    // Locked, clean passes ciphertext through untouched: rekey would be a
+    // no-op. A clone set up with `init` has no locked filter and may rekey.
+    if ctx.pinned_policy()?.is_none()
+        && gitcli::config_get(&root, "filter.git-agecrypt.process")?.is_some()
+    {
+        anyhow::bail!("rekey needs this worktree unlocked: git-agecrypt on first");
+    }
     let specs: Vec<String> = paths
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
@@ -163,7 +170,7 @@ fn ensure_state(result: git::Result<()>) -> Result<()> {
 /// re-parsed by a POSIX shell (msys2 sh on Windows). Plain double quotes
 /// handle spaces; we additionally backslash-escape `\` and `"` so paths
 /// containing those characters round-trip safely.
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for ch in s.chars() {

@@ -12,6 +12,15 @@ use age::{
 };
 use anyhow::{Context, Result, bail};
 
+/// age's file header, the first line of every ciphertext.
+pub(crate) const MAGIC: &[u8] = b"age-encryption.org/v1";
+
+/// Ciphertext whose whole header parses: the first line alone could open a
+/// plaintext file.
+pub(crate) fn is_ciphertext(data: &[u8]) -> bool {
+    data.starts_with(MAGIC) && Decryptor::new(data).is_ok()
+}
+
 #[cfg(test)]
 pub(crate) fn decrypt(
     identities: &[impl AsRef<Path>],

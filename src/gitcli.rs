@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Thin helpers over the git CLI for what libgit2 does not offer here:
-//! check-attr in bulk and pathspecs through the filter (rekey), config
-//! lookups as git resolves them (sign). Paths never go on argv: a repo can
-//! hold thousands of encrypted files.
+//! Thin helpers over the git CLI for the worktree commands (on, off, check,
+//! sign, rekey). They need what libgit2 does not offer here: config hooks,
+//! `includeIf`, check-attr in bulk, and checkout through the filter. Paths
+//! never go on argv: a ring holds thousands of files.
 
 use std::{
-    collections::HashSet,
-    io::Write,
+    collections::{HashMap, HashSet},
+    io::{BufRead, BufReader, Read, Write},
     path::Path,
     process::{Command, Output, Stdio},
 };
@@ -112,4 +112,120 @@ pub(crate) fn filtered(root: &Path, paths: &[String]) -> Result<HashSet<String>>
         .filter(|t| t.len() == 3 && t[2] == "git-agecrypt")
         .map(|t| t[0].clone())
         .collect())
+}
+
+pub(crate) struct Entry {
+    pub mode: String,
+    pub oid: String,
+}
+
+/// Submodule entries point at commits of another repo: no blob to read.
+const GITLINK_MODE: &str = "160000";
+
+/// The whole index: path to mode and blob id, submodules left out.
+pub(crate) fn index(root: &Path) -> Result<HashMap<String, Entry>> {
+    let args = ["ls-files", "-s", "-z"];
+    Ok(nul_split(&checked(output(root, &args)?, &args)?)?
+        .into_iter()
+        .filter_map(|e| {
+            let (meta, path) = e.split_once('\t')?;
+            let mut f = meta.split(' ');
+            let mode = f.next()?.to_owned();
+            let oid = f.next()?.to_owned();
+            (mode != GITLINK_MODE).then(|| (path.to_owned(), Entry { mode, oid }))
+        })
+        .collect())
+}
+
+/// HEAD's tree: path to blob id, submodules left out. Empty before the first commit.
+pub(crate) fn head(root: &Path) -> Result<HashMap<String, String>> {
+    let args = ["ls-tree", "-r", "-z", "HEAD"];
+    let out = output(root, &args)?;
+    if !out.status.success() {
+        return Ok(HashMap::new());
+    }
+    Ok(nul_split(&out.stdout)?
+        .into_iter()
+        .filter_map(|e| {
+            let (meta, path) = e.split_once('\t')?;
+            let mut f = meta.split(' ');
+            let mode = f.next()?;
+            let oid = f.nth(1)?;
+            (mode != GITLINK_MODE).then(|| (path.to_owned(), oid.to_owned()))
+        })
+        .collect())
+}
+
+/// Blob contents by id, in one `cat-file --batch`.
+pub(crate) fn blobs(root: &Path, oids: &[String]) -> Result<HashMap<String, Vec<u8>>> {
+    if oids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let raw = run_with_input(
+        root,
+        &["cat-file", "--batch"],
+        (oids.join("\n") + "\n").into_bytes(),
+    )?;
+    let mut reader = BufReader::new(&raw[..]);
+    let mut out = HashMap::new();
+    let mut header = String::new();
+    while reader.read_line(&mut header)? > 0 {
+        let fields: Vec<&str> = header.split_whitespace().collect();
+        let [oid, _kind, size] = fields[..] else {
+            bail!("git cat-file: unexpected header {header:?}");
+        };
+        let mut data = vec![0u8; size.parse()?];
+        reader.read_exact(&mut data)?;
+        let mut newline = [0u8; 1];
+        reader.read_exact(&mut newline)?;
+        out.insert(oid.to_owned(), data);
+        header.clear();
+    }
+    Ok(out)
+}
+
+/// Paths `git status` reports as changed, staged or untracked.
+pub(crate) fn dirty(root: &Path) -> Result<HashSet<String>> {
+    let args = ["status", "--porcelain", "-z"];
+    parse_porcelain(&checked(output(root, &args)?, &args)?)
+}
+
+fn parse_porcelain(raw: &[u8]) -> Result<HashSet<String>> {
+    let mut out = HashSet::new();
+    let mut entries = raw.split(|&b| b == 0).filter(|s| !s.is_empty());
+    while let Some(entry) = entries.next() {
+        let entry = String::from_utf8(entry.to_vec())?;
+        let Some((status, path)) = entry.split_at_checked(3) else {
+            bail!("git status: unexpected entry {entry:?}");
+        };
+        out.insert(path.to_owned());
+        // A rename or copy, staged (X) or in the worktree (Y, after
+        // `add -N`), carries its original path as the next entry.
+        if status[..2].contains(['R', 'C']) {
+            let orig = entries
+                .next()
+                .context("git status: rename without its source")?;
+            out.insert(String::from_utf8(orig.to_vec())?);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn porcelain_keeps_both_sides_of_staged_and_worktree_renames() {
+        let raw = b"R  new\0old\0 R moved/b\0moved/a\0?? untracked\0";
+        let paths = parse_porcelain(raw).unwrap();
+        let mut paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+        paths.sort();
+        assert_eq!(paths, ["moved/a", "moved/b", "new", "old", "untracked"]);
+    }
+
+    #[test]
+    fn porcelain_refuses_a_rename_without_its_source() {
+        assert!(parse_porcelain(b"R  new\0").is_err());
+    }
 }

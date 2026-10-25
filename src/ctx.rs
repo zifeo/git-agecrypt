@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -24,6 +25,19 @@ pub(crate) trait Context {
 
     fn load_cache(&self, for_path: &Path) -> Result<Option<CacheEntry>>;
 
+    /// Plaintext hashes of every file decrypted in this worktree (check spots
+    /// copies of ring content outside the rings with them).
+    fn cached_plaintext_hashes(&self) -> Result<HashSet<[u8; 32]>>;
+
+    /// The working file still holds the plaintext last decrypted or encrypted.
+    fn matches_cache(&self, for_path: &Path) -> Result<bool> {
+        let Some(entry) = self.load_cache(for_path)? else {
+            return Ok(false);
+        };
+        Ok(fs::read(for_path)
+            .is_ok_and(|data| *blake3::hash(&data).as_bytes() == entry.plaintext_hash))
+    }
+
     fn current_exe(&self) -> Result<String>;
 
     fn remove_sidecar_files(&self) -> Result<()>;
@@ -33,6 +47,10 @@ pub(crate) trait Context {
     /// `git-agecrypt.config.identityCommand` values: commands that print an
     /// age identity file (e.g. a secret manager read), run once per process.
     fn identity_commands(&self) -> Result<Vec<String>>;
+
+    /// Policy digest pinned by `git-agecrypt on`, present only in an unlocked
+    /// worktree. When set, clean refuses to encrypt under any other policy.
+    fn pinned_policy(&self) -> Result<Option<String>>;
 
     fn config(&self) -> Result<AppConfig>;
 }
@@ -120,6 +138,21 @@ impl<R: git::Repository> Context for ContextWrapper<R> {
         }
     }
 
+    fn cached_plaintext_hashes(&self) -> Result<HashSet<[u8; 32]>> {
+        let entries = match fs::read_dir(self.cache_directory()) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = HashSet::new();
+        for entry in entries {
+            if let Some(cached) = CacheEntry::decode(&fs::read(entry?.path())?) {
+                out.insert(cached.plaintext_hash);
+            }
+        }
+        Ok(out)
+    }
+
     fn current_exe(&self) -> Result<String> {
         let exe = std::env::current_exe()?;
         // The exe path is embedded into `.git/config` as the filter / diff
@@ -167,6 +200,13 @@ impl<R: git::Repository> Context for ContextWrapper<R> {
             .list_config(r"^git-agecrypt\.config\.identitycommand$")?)
     }
 
+    fn pinned_policy(&self) -> Result<Option<String>> {
+        Ok(self
+            .repo
+            .list_config(r"^git-agecrypt\.policy\.pinned$")?
+            .pop())
+    }
+
     fn config(&self) -> Result<AppConfig> {
         Ok(AppConfig::load(
             &PathBuf::from("git-agecrypt.toml"),
@@ -197,6 +237,10 @@ mod tests {
         fn path(&self) -> &Path {
             &self.gitdir
         }
+        fn has_blob(&self, _: &[u8]) -> git::Result<bool> {
+            Ok(false)
+        }
+
         fn get_file_contents(&self, _: &Path) -> git::Result<Vec<u8>> {
             unimplemented!()
         }

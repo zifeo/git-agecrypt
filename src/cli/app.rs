@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use crate::ctx::Context;
 
-use super::{internal, process, public};
+use super::{check, internal, process, public, worktree};
 
 use super::args::{Args, Commands, InternalCommands, ModifyConfig, PublicCommands, QueryConfig};
 
@@ -25,6 +25,9 @@ fn run_internal_command(commands: InternalCommands, ctx: impl Context) -> Result
 
 fn run_public_command(commands: PublicCommands, ctx: impl Context) -> Result<()> {
     match commands {
+        PublicCommands::On { trust } => return worktree::on(&ctx, trust),
+        PublicCommands::Off => return worktree::off(&ctx),
+        PublicCommands::Check { staged, paths } => return check::check(&ctx, staged, paths),
         PublicCommands::Sign => {
             let root = crate::git::Repository::workdir(ctx.repo());
             let version = crate::policy::sign(root)?;
@@ -39,6 +42,7 @@ fn run_public_command(commands: PublicCommands, ctx: impl Context) -> Result<()>
             };
             let policy = crate::policy::Policy::read(root)?;
             let signer = crate::policy::verify(&trust, &policy)?;
+            crate::policy::check_accepted(root, &policy)?;
             println!("policy v{} signed by {signer}", policy.version()?);
             return Ok(());
         }
@@ -47,9 +51,12 @@ fn run_public_command(commands: PublicCommands, ctx: impl Context) -> Result<()>
     }
     let cmd = public::CommandContext::new(ctx);
     match commands {
-        PublicCommands::Sign | PublicCommands::Verify { .. } | PublicCommands::Rekey { .. } => {
-            unreachable!("handled above")
-        }
+        PublicCommands::On { .. }
+        | PublicCommands::Off
+        | PublicCommands::Check { .. }
+        | PublicCommands::Sign
+        | PublicCommands::Verify { .. }
+        | PublicCommands::Rekey { .. } => unreachable!("handled above"),
         PublicCommands::Init => {
             cmd.init()?;
         }

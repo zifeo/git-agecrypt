@@ -28,6 +28,15 @@ fn public(key_file: &Path) -> String {
     id.to_public().to_string()
 }
 
+fn opens(blob: &[u8], key_file: &Path) -> bool {
+    let id: age::x25519::Identity = fs::read_to_string(key_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    age::decrypt(&id, blob).is_ok()
+}
+
 fn verify(r: &Repo) -> std::process::Output {
     r.ac(&["verify", "--trust", r.trust().to_str().unwrap()])
 }
@@ -49,12 +58,60 @@ fn the_policy_is_one_file_signed_last() {
 }
 
 #[test]
+fn anything_after_the_signature_is_refused() {
+    let r = Repo::new();
+    r.write(
+        "git-agecrypt.toml",
+        &format!("{}[extra]\nx = 1\n", toml(&r)),
+    );
+    let out = r.on_in(&r.root);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("only the signature may follow"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
 fn an_edit_above_the_signature_voids_it() {
     let r = Repo::new();
     r.add_unsigned_recipient("ring-b/**");
     let out = verify(&r);
     assert!(!out.status.success());
     assert!(stderr(&out).contains("does not match"), "{}", stderr(&out));
+}
+
+#[test]
+fn key_names_stand_for_their_keys_and_edits_keep_comments() {
+    let r = Repo::new();
+    let (a, b) = (r.outside("a.key"), r.outside("b.key"));
+    let commented = toml(&r).replacen("[config]", "# rings list people\n[config]", 1);
+    r.write("git-agecrypt.toml", &commented);
+    r.ac_ok(&[
+        "config",
+        "add",
+        "--name",
+        "teo",
+        "-r",
+        &public(&a),
+        "-p",
+        "ring-b/**",
+    ]);
+    r.ac_ok(&["config", "remove", "-r", &public(&b), "-p", "ring-b/**"]);
+    let t = toml(&r);
+    assert!(t.contains("# rings list people"), "{t}");
+    assert!(t.contains(&format!("teo = \"{}\"", public(&a))), "{t}");
+    assert!(t.contains("\"ring-b/**\" = [\"teo\"]"), "{t}");
+    assert!(t.contains("[policy]") && !t.contains("[signature]"), "{t}");
+    r.ac_ok(&["sign"]);
+    r.on();
+    r.write(B, "payload-b\n");
+    r.git_ok(&["add", B]);
+    let blob = r.staged(B);
+    assert!(blob.starts_with(MAGIC));
+    assert!(opens(&blob, &a), "teo's key must open ring-b");
+    assert!(!opens(&blob, &b), "b's key was removed from ring-b");
 }
 
 #[test]
@@ -86,6 +143,19 @@ fn a_ring_mixing_classic_and_post_quantum_keys_is_refused_at_sign() {
         "{}",
         stderr(&out)
     );
+}
+
+#[test]
+fn verify_refuses_a_rollback_like_on() {
+    let r = Repo::new();
+    r.on();
+    r.add_unsigned_recipient("ring-b/**");
+    r.ac_ok(&["sign"]);
+    r.on();
+    r.git_ok(&["checkout", "HEAD", "--", "git-agecrypt.toml"]);
+    let out = verify(&r);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("rollback"), "{}", stderr(&out));
 }
 
 #[test]

@@ -17,6 +17,7 @@ use crate::{
     ctx::Context,
     git::Error as GitError,
     git::Repository,
+    policy,
 };
 
 type Identities = Vec<Box<dyn ::age::Identity>>;
@@ -66,6 +67,33 @@ impl<C: Context> CommandContext<C> {
     pub(crate) fn clean_bytes(&self, file: &Path, contents: Vec<u8>) -> Result<Vec<u8>> {
         log::info!("Encrypting file");
         let workdir = self.ctx.repo().workdir().to_path_buf();
+        if let Some(pinned) = self.ctx.pinned_policy()?
+            && policy::digest(&workdir)? != pinned
+        {
+            bail!(
+                "rings or recipients changed since git-agecrypt on: refusing to encrypt {}",
+                file.display()
+            );
+        }
+        // Already ciphertext: a blob git holds (a failed smudge left it) or one a
+        // key here opens (a copied .age). Encrypting it again would hide it
+        // behind two layers; storing an unknown one as-is could store plaintext
+        // behind a forged header.
+        if contents.starts_with(age::MAGIC) {
+            if self.ctx.repo().has_blob(&contents)?
+                || matches!(
+                    age::decrypt_with(self.identities()?, &contents),
+                    Ok(Some(_))
+                )
+            {
+                return Ok(contents);
+            }
+            bail!(
+                "{}: starts like age ciphertext, but neither git nor a key here knows it: \
+                 refusing to store it as-is",
+                file.display()
+            );
+        }
         let file = workdir.join(file);
         let hash = *blake3::hash(&contents).as_bytes();
         let recipients = self.ctx.config()?.get_public_keys(&file)?;
@@ -226,6 +254,10 @@ mod tests {
         fn path(&self) -> &Path {
             &self.gitdir
         }
+        fn has_blob(&self, _: &[u8]) -> git::Result<bool> {
+            Ok(false)
+        }
+
         fn get_file_contents(&self, path: &Path) -> git::Result<Vec<u8>> {
             let rel = path.strip_prefix(&self.workdir).unwrap_or(path);
             self.head
@@ -300,6 +332,15 @@ mod tests {
             Ok(self.cache.borrow().get(path).cloned())
         }
 
+        fn cached_plaintext_hashes(&self) -> Result<std::collections::HashSet<[u8; 32]>> {
+            Ok(self
+                .cache
+                .borrow()
+                .values()
+                .map(|e| e.plaintext_hash)
+                .collect())
+        }
+
         fn current_exe(&self) -> Result<String> {
             unimplemented!()
         }
@@ -315,6 +356,10 @@ mod tests {
 
         fn identity_commands(&self) -> Result<Vec<String>> {
             Ok(vec![])
+        }
+
+        fn pinned_policy(&self) -> Result<Option<String>> {
+            Ok(None)
         }
 
         fn config(&self) -> Result<AppConfig> {

@@ -38,6 +38,9 @@ pub(crate) trait Repository {
 
     fn get_file_contents(&self, path: &Path) -> Result<Vec<u8>>;
 
+    /// Whether the object database already holds `data` as a blob.
+    fn has_blob(&self, data: &[u8]) -> Result<bool>;
+
     fn add_config(&self, key: &str, value: &str) -> Result<()>;
 
     fn contains_config(&self, key: &str, value: &str) -> bool;
@@ -80,6 +83,11 @@ impl LibGit2Repository {
 impl Repository for LibGit2Repository {
     fn workdir(&self) -> &Path {
         self.inner.workdir().unwrap() // None in case of bare repo
+    }
+
+    fn has_blob(&self, data: &[u8]) -> Result<bool> {
+        let oid = git2::Oid::hash_object(git2::ObjectType::Blob, data)?;
+        Ok(self.inner.odb()?.exists(oid))
     }
 
     fn path(&self) -> &Path {

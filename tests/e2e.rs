@@ -989,7 +989,8 @@ fn rekey_moves_unchanged_files_to_new_recipients() {
 }
 
 #[test]
-fn process_filter_round_trips() {
+fn process_filter_stays_locked_without_a_pin() {
+    // Without `on`, the process filter never lets plaintext into the index.
     let fx = Fixture::new();
     fx.install_filter();
     fx.add_identity();
@@ -1002,19 +1003,16 @@ fn process_filter_round_trips() {
         "filter.git-agecrypt.process",
         &format!("\"{exe}\" process"),
     ]);
-    fx.write("secrets/secret.txt", "through the process filter");
+    fx.write("secrets/secret.txt", "plaintext");
     fx.add_recipient_for("secret.txt");
-    fx.git(&[
-        "add",
-        ".gitattributes",
-        "git-agecrypt.toml",
-        "secrets/secret.txt",
-    ]);
-    fx.git(&["commit", "-m", "secret"]);
-    assert!(staged_bytes(&fx, "secrets/secret.txt").starts_with(b"age-encryption.org/v1"));
-    fs::remove_file(fx.workdir().join("secrets/secret.txt")).unwrap();
-    fx.git(&["checkout", "--", "secrets/secret.txt"]);
-    assert_eq!(fx.read("secrets/secret.txt"), "through the process filter");
+    let out = cmd("git", ["add", "secrets/secret.txt"])
+        .dir(fx.workdir())
+        .stderr_capture()
+        .unchecked()
+        .run()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("this worktree is locked"));
 }
 
 #[test]
