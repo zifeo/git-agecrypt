@@ -4,7 +4,7 @@
 use std::{
     cell::{Cell, OnceCell},
     fs,
-    io::{self, Read, Write},
+    io::{self, IsTerminal, Read, Write},
     path::Path,
     process::{Command, Stdio},
 };
@@ -74,11 +74,14 @@ impl<C: Context> CommandContext<C> {
         Ok(self.identities()?.is_empty())
     }
 
+    /// For a person at a terminal only: a diff smudges every blob it shows
+    /// too, and tools that capture stderr (gitleaks) take any line for a
+    /// failure.
     fn warn_keyless(&self) {
-        if !self.warned.replace(true) {
+        if !self.warned.replace(true) && io::stderr().is_terminal() {
             eprintln!(
-                "git-agecrypt: no key in this git command, the ring files it brings stay \
-                 ciphertext: git-agecrypt on to decrypt them"
+                "git-agecrypt: no key in this git command, ring files stay ciphertext \
+                 here: git-agecrypt on decrypts them"
             );
         }
     }

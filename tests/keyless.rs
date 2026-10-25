@@ -52,7 +52,8 @@ fn a_keyless_checkout_keeps_ciphertext_until_on() {
     r.git_ok(&["commit", "-q", "-am", "side"]);
     let out = r.git(&["checkout", "-q", "main"]);
     ok(out.clone(), "keyless checkout");
-    assert!(stderr(&out).contains("git-agecrypt on"), "{}", stderr(&out));
+    // The notice is for a terminal: captured stderr, as gitleaks reads it, stays empty.
+    assert!(stderr(&out).is_empty(), "{}", stderr(&out));
     assert_eq!(
         r.read(A),
         r.staged(A),
@@ -72,7 +73,9 @@ fn a_keyless_diff_names_the_missing_key() {
     let r = unlocked_with_secrets();
     r.write(A, "second\n");
     r.git_ok(&["commit", "-q", "-am", "second"]);
-    let keyless = r.git_ok(&["log", "-p", "-1", "--", A]);
+    let out = r.git(&["log", "-p", "-1", "--", A]);
+    assert!(stderr(&out).is_empty(), "{}", stderr(&out));
+    let keyless = ok(out, "keyless git log");
     assert!(keyless.contains("no key in this git command"), "{keyless}");
     let keyed = ok(
         r.git_key(&["log", "-p", "-1", "--", A]),
