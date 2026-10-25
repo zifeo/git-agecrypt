@@ -83,7 +83,7 @@ pub(crate) fn decrypt_with(
 const PQ_SECRET_PREFIX: &str = "AGE-SECRET-KEY-PQ-1";
 const PQ_PLUGIN: &str = "age-plugin-pq";
 
-/// Identities from the text an `identityCommand` printed (an identity file).
+/// Identities from identity file text (an `identityCommand` output, `GIT_AGECRYPT_IDENTITY`).
 pub(crate) fn identities_from_text(text: &str) -> Result<Vec<Box<dyn Identity>>> {
     // Only the post-quantum lines go to age-plugin-pq: it rejects anything else.
     let (pq, other): (Vec<&str>, Vec<&str>) = text
@@ -95,12 +95,12 @@ pub(crate) fn identities_from_text(text: &str) -> Result<Vec<Box<dyn Identity>>>
         text.push_str(&pq_plugin_identity(&format!("{}\n", pq.join("\n")))?);
     }
     let ids = IdentityFile::from_buffer(io::Cursor::new(text.into_bytes()))
-        .context("identityCommand output is not an age identity file")?
+        .context("not an age identity file")?
         .with_callbacks(NoCallbacks)
         .into_identities()
-        .context("identityCommand output holds no usable identity")?;
+        .context("holds no usable identity")?;
     if ids.is_empty() {
-        bail!("identityCommand printed no identity");
+        bail!("holds no identity");
     }
     Ok(ids)
 }

@@ -26,11 +26,27 @@ pub struct Repo {
     pub root: PathBuf,
 }
 
+/// Holds the identity file text itself, as a secret manager fills it.
+pub const IDENTITY_ENV: &str = "GIT_AGECRYPT_IDENTITY";
+
 pub fn run_in<P: duct::IntoExecutablePath>(dir: &Path, program: P, args: &[&str]) -> Output {
-    cmd(program, args)
-        .dir(dir)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .stdout_capture()
+    run_with_key(dir, program, args, None)
+}
+
+/// The caller's own key never leaks in: only `key` reaches the command.
+pub fn run_with_key<P: duct::IntoExecutablePath>(
+    dir: &Path,
+    program: P,
+    args: &[&str],
+    key: Option<&str>,
+) -> Output {
+    let c = cmd(program, args).dir(dir).env("GIT_CONFIG_NOSYSTEM", "1");
+    // duct applies the outermost call first: never both on one expression.
+    let c = match key {
+        Some(key) => c.env(IDENTITY_ENV, key),
+        None => c.env_remove(IDENTITY_ENV),
+    };
+    c.stdout_capture()
         .stderr_capture()
         .unchecked()
         .run()
@@ -206,6 +222,28 @@ impl Repo {
             &format!("\"{ring}\" = [\"{stranger}\", \""),
         );
         self.write("git-agecrypt.toml", &toml);
+    }
+
+    /// Both ring keys as one identity file, the way Lade hands them over.
+    pub fn key_text(&self) -> String {
+        let a = fs::read_to_string(self.outside("a.key")).unwrap();
+        let b = fs::read_to_string(self.outside("b.key")).unwrap();
+        format!("{a}{b}")
+    }
+
+    /// Drop identityCommand: the key then exists only where a command gets it.
+    pub fn use_env_key(&self) {
+        self.git_ok(&["config", "--unset", "git-agecrypt.config.identityCommand"]);
+    }
+
+    pub fn git_key(&self, args: &[&str]) -> Output {
+        run_with_key(&self.root, "git", args, Some(&self.key_text()))
+    }
+
+    pub fn on_key(&self) -> Output {
+        let trust = self.trust();
+        let args = ["on", "--trust", trust.to_str().unwrap()];
+        run_with_key(&self.root, bin(), &args, Some(&self.key_text()))
     }
 
     pub fn cache_dir(&self) -> PathBuf {

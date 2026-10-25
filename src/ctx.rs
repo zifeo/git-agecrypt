@@ -16,6 +16,9 @@ use crate::{
     git,
 };
 
+/// Environment variable holding the identity file text itself, never a path.
+pub(crate) const IDENTITY_ENV: &str = "GIT_AGECRYPT_IDENTITY";
+
 pub(crate) trait Context {
     type Repo: git::Repository;
 
@@ -47,6 +50,21 @@ pub(crate) trait Context {
     /// `git-agecrypt.config.identityCommand` values: commands that print an
     /// age identity file (e.g. a secret manager read), run once per process.
     fn identity_commands(&self) -> Result<Vec<String>>;
+
+    /// The identity file text in `GIT_AGECRYPT_IDENTITY`, when set and not
+    /// empty: a secret manager hands it to one command, nothing is stored.
+    fn identity_env(&self) -> Option<String> {
+        std::env::var(IDENTITY_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+    }
+
+    /// Any key source at all, so `on` can refuse before it unlocks anything.
+    fn has_identity_source(&self) -> Result<bool> {
+        Ok(self.identity_env().is_some()
+            || !self.identity_commands()?.is_empty()
+            || !self.age_identities().list()?.is_empty())
+    }
 
     /// Policy digest pinned by `git-agecrypt on`, present only in an unlocked
     /// worktree. When set, clean refuses to encrypt under any other policy.

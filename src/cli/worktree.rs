@@ -18,7 +18,11 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 
 use super::public::shell_quote;
-use crate::{ctx::Context, git::Repository, gitcli, policy};
+use crate::{
+    ctx::{Context, IDENTITY_ENV},
+    git::Repository,
+    gitcli, policy,
+};
 
 const INCLUDE: &str = "git-agecrypt.gitconfig";
 const HOOK: &str = "git-agecrypt-check";
@@ -227,12 +231,38 @@ fn ensure_index_content(root: &Path, paths: &HashSet<String>) -> Result<()> {
     Ok(())
 }
 
+/// Ring files whose disk content is exactly their index blob: ciphertext a
+/// keyless smudge left. Only those: a checkout over anything else could lose
+/// work.
+fn index_ciphertext(root: &Path, paths: &HashSet<String>) -> Result<HashSet<String>> {
+    let index = gitcli::index(root)?;
+    let oids: Vec<String> = paths
+        .iter()
+        .filter_map(|p| index.get(p).map(|e| e.oid.clone()))
+        .collect();
+    let blobs = gitcli::blobs(root, &oids)?;
+    Ok(paths
+        .iter()
+        .filter(|p| {
+            let on_disk = fs::read(root.join(p)).ok();
+            index
+                .get(*p)
+                .and_then(|e| blobs.get(&e.oid))
+                .is_some_and(|blob| {
+                    blob.starts_with(crate::age::MAGIC) && on_disk.as_ref() == Some(blob)
+                })
+        })
+        .cloned()
+        .collect())
+}
+
 pub(crate) fn on<C: Context>(ctx: &C, trust: Option<PathBuf>) -> Result<()> {
     let root = ctx.repo().workdir().to_path_buf();
     let exe = canonical_exe(&root, &ctx.current_exe()?)?;
-    if ctx.identity_commands()?.is_empty() && ctx.age_identities().list()?.is_empty() {
+    if !ctx.has_identity_source()? {
         bail!(
-            "no identity: set git-agecrypt.config.identityCommand (or identity) outside the repo"
+            "no key: {IDENTITY_ENV} is empty and no identityCommand or identity is set; \
+             run on where your secret manager fills {IDENTITY_ENV}"
         );
     }
     let trust = match trust {
@@ -259,7 +289,11 @@ pub(crate) fn on<C: Context>(ctx: &C, trust: Option<PathBuf>) -> Result<()> {
                 bail!("{path} leaves the rings with uncommitted changes: commit or move it first");
             }
         }
+        // A git command without the key left these as ciphertext.
         leaving
+            .union(&index_ciphertext(&root, &after)?)
+            .cloned()
+            .collect()
     } else {
         refuse_dirty(&root, &after, "on")?;
         after

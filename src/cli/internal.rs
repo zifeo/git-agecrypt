@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use std::{
-    cell::OnceCell,
+    cell::{Cell, OnceCell},
     fs,
     io::{self, Read, Write},
     path::Path,
@@ -14,7 +14,7 @@ use anyhow::{Context as _, Result, bail};
 use crate::{
     age,
     cache::{self, CacheEntry},
-    ctx::Context,
+    ctx::{Context, IDENTITY_ENV},
     git::Error as GitError,
     git::Repository,
     policy,
@@ -22,12 +22,19 @@ use crate::{
 
 type Identities = Vec<Box<dyn ::age::Identity>>;
 
+/// What a diff shows for a ring file when the git command has no key, before
+/// a short hash of the ciphertext: without it both sides read the same and git
+/// would show no change at all.
+const KEYLESS_TEXTCONV: &str = "age ciphertext, no key in this git command:";
+
 pub(crate) struct CommandContext<C: Context> {
     pub ctx: C,
     /// Loaded once per process, so a long-running filter reads the secret
     /// store once. A failure is kept too: a cancelled secret-store prompt must
     /// not come back once per file.
     identities: OnceCell<std::result::Result<Identities, String>>,
+    /// The keyless notice is said once per git command, not once per file.
+    warned: Cell<bool>,
 }
 
 impl<C: Context> CommandContext<C> {
@@ -35,6 +42,7 @@ impl<C: Context> CommandContext<C> {
         Self {
             ctx,
             identities: OnceCell::new(),
+            warned: Cell::new(false),
         }
     }
 
@@ -47,10 +55,32 @@ impl<C: Context> CommandContext<C> {
 
     fn load_identities(&self) -> Result<Identities> {
         let mut ids = age::load_identities(&self.get_identities()?)?;
+        if let Some(text) = self.ctx.identity_env() {
+            ids.extend(age::identities_from_text(&text).context(IDENTITY_ENV)?);
+        }
         for command in self.ctx.identity_commands()? {
-            ids.extend(age::identities_from_text(&run_identity_command(&command)?)?);
+            let text = run_identity_command(&command)?;
+            ids.extend(
+                age::identities_from_text(&text)
+                    .with_context(|| format!("identityCommand {command:?} output"))?,
+            );
         }
         Ok(ids)
+    }
+
+    /// No key in this process: `GIT_AGECRYPT_IDENTITY` lives only for the
+    /// command a secret manager filled it for, so a later pull has none.
+    fn keyless(&self) -> Result<bool> {
+        Ok(self.identities()?.is_empty())
+    }
+
+    fn warn_keyless(&self) {
+        if !self.warned.replace(true) {
+            eprintln!(
+                "git-agecrypt: no key in this git command, the ring files it brings stay \
+                 ciphertext: git-agecrypt on to decrypt them"
+            );
+        }
     }
 
     pub(crate) fn clean(&self, file: impl AsRef<Path>) -> Result<()> {
@@ -112,7 +142,7 @@ impl<C: Context> CommandContext<C> {
             return Ok(e.ciphertext.clone());
         }
         if entry.as_ref().is_none_or(known)
-            && let Some(head) = self.head_ciphertext_for(&file, &contents)?
+            && let Some(head) = self.head_ciphertext_for(&file, &contents, entry.as_ref())?
         {
             self.store(&file, hash, fp, head.clone())?;
             return Ok(head);
@@ -134,8 +164,17 @@ impl<C: Context> CommandContext<C> {
         )
     }
 
-    /// HEAD's ciphertext when it decrypts to `contents`, so the index does not churn.
-    fn head_ciphertext_for(&self, file: &Path, contents: &[u8]) -> Result<Option<Vec<u8>>> {
+    /// HEAD's ciphertext when it decrypts to `contents`, so the index does not
+    /// churn. Encrypting needs public keys only, so this never asks for a key
+    /// it does not need: a cache entry holding HEAD's ciphertext already says
+    /// whether `contents` is HEAD's plaintext, and without a key a fresh
+    /// encryption only costs a new blob.
+    fn head_ciphertext_for(
+        &self,
+        file: &Path,
+        contents: &[u8],
+        entry: Option<&CacheEntry>,
+    ) -> Result<Option<Vec<u8>>> {
         let head = match self.ctx.repo().get_file_contents(file) {
             Ok(v) => v,
             Err(GitError::NotExist(s)) => {
@@ -144,7 +183,14 @@ impl<C: Context> CommandContext<C> {
             }
             Err(e) => return Err(e.into()),
         };
-        let decrypted = age::decrypt_with(self.identities()?, &head)?.unwrap_or_default();
+        if entry.is_some_and(|e| e.ciphertext == head) {
+            return Ok(None);
+        }
+        let ids = match self.identities() {
+            Ok(ids) if !ids.is_empty() => ids,
+            _ => return Ok(None),
+        };
+        let decrypted = age::decrypt_with(ids, &head)?.unwrap_or_default();
         Ok((decrypted == contents).then_some(head))
     }
 
@@ -176,6 +222,12 @@ impl<C: Context> CommandContext<C> {
         log::info!("Decrypting file");
         let file = self.ctx.repo().workdir().join(file);
 
+        if self.keyless()? && encrypted.starts_with(age::MAGIC) {
+            // git already holds this blob: clean hands it back unchanged, so
+            // the file is not dirty and no plaintext exists anywhere.
+            self.warn_keyless();
+            return Ok(encrypted);
+        }
         let Some(rv) = age::decrypt_with(self.identities()?, &encrypted)? else {
             bail!("Input isn't encrypted")
         };
@@ -198,6 +250,11 @@ impl<C: Context> CommandContext<C> {
     pub(crate) fn textconv(&self, path: impl AsRef<Path>) -> Result<()> {
         log::info!("Decrypting file to show in diff");
         let data = fs::read(path)?;
+        if self.keyless()? && data.starts_with(age::MAGIC) {
+            let hash = blake3::hash(&data).to_hex();
+            let line = format!("{KEYLESS_TEXTCONV} {}\n", &hash.as_str()[..12]);
+            return Ok(io::stdout().write_all(line.as_bytes())?);
+        }
         let result = match age::decrypt_with(self.identities()?, &data)? {
             Some(rv) => rv,
             None => {
@@ -356,6 +413,11 @@ mod tests {
 
         fn identity_commands(&self) -> Result<Vec<String>> {
             Ok(vec![])
+        }
+
+        // The developer's own environment must not reach the fixture.
+        fn identity_env(&self) -> Option<String> {
+            None
         }
 
         fn pinned_policy(&self) -> Result<Option<String>> {
