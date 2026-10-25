@@ -12,6 +12,15 @@
 
 Transparent file-level encryption for files in a git repository, powered by [age](https://age-encryption.org). The plaintext stays in your working tree; the ciphertext is what travels through `git add`, `git push`, and ends up in the remote.
 
+> **This fork** ([zifeo/git-agecrypt](https://github.com/zifeo/git-agecrypt))
+> builds on bartei's line, which continues
+> [vlaci/git-agecrypt](https://github.com/vlaci/git-agecrypt) by László Vaskó.
+> It ports vlaci's 0.6 recipient-aware cache and `rekey`, and adds identity
+> commands, a single-process filter, post-quantum identities, key names, a
+> signed policy and a per-worktree unlock: see
+> [Per-worktree unlock and signed policy](#per-worktree-unlock-and-signed-policy).
+> The badges above describe upstream.
+
 `git-agecrypt` is a modern, portable replacement for [git-crypt](https://github.com/AGWA/git-crypt): same workflow, but using age instead of GPG. Recipients can be age x25519 keys, OpenSSH ed25519 / RSA keys, or any [age plugin](https://github.com/FiloSottile/awesome-age) recipient (e.g. YubiKey PIV via `age-plugin-yubikey`).
 
 ## Features
