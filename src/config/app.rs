@@ -190,6 +190,14 @@ impl AppConfig {
         Ok(out)
     }
 
+    /// Every `config` entry with its resolved recipients, sorted by pattern.
+    pub fn resolved(&self) -> Result<BTreeMap<String, Vec<String>>> {
+        self.config
+            .iter()
+            .map(|(p, rs)| Ok((p.to_string_lossy().into_owned(), self.resolve(rs)?)))
+            .collect()
+    }
+
     /// Name keys, then grant the name on `paths`: `teo` stands for both
     /// `age1…` in every ring that lists it.
     pub fn add_named(

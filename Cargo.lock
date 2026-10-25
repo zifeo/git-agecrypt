@@ -928,6 +928,7 @@ dependencies = [
  "env_logger",
  "git2",
  "globset",
+ "libc",
  "log",
  "regex",
  "rstest",

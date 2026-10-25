@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! Thin helpers over the git CLI for what libgit2 does not offer here:
-//! check-attr in bulk and pathspecs through the filter (rekey). Paths never
-//! go on argv: a repo can hold thousands of encrypted files.
+//! check-attr in bulk and pathspecs through the filter (rekey), config
+//! lookups as git resolves them (sign). Paths never go on argv: a repo can
+//! hold thousands of encrypted files.
 
 use std::{
     collections::HashSet,
@@ -29,6 +30,11 @@ fn checked(out: Output, args: &[&str]) -> Result<Vec<u8>> {
         );
     }
     Ok(out.stdout)
+}
+
+/// Run git, return stdout, fail with git's stderr.
+pub(crate) fn run(dir: &Path, args: &[&str]) -> Result<String> {
+    Ok(String::from_utf8(checked(output(dir, args)?, args)?)?)
 }
 
 /// Run git with `input` on stdin, fed from a thread so large inputs and large
@@ -68,6 +74,12 @@ pub(crate) fn run_with_paths(dir: &Path, args: &[&str], paths: &[String]) -> Res
     full.extend(["--pathspec-from-file=-", "--pathspec-file-nul"]);
     run_with_input(dir, &full, nul_joined(paths))?;
     Ok(())
+}
+
+pub(crate) fn config_get(dir: &Path, key: &str) -> Result<Option<String>> {
+    let out = output(dir, &["config", "--get", key])?;
+    let value = String::from_utf8(out.stdout)?.trim().to_owned();
+    Ok((out.status.success() && !value.is_empty()).then_some(value))
 }
 
 fn nul_split(bytes: &[u8]) -> Result<Vec<String>> {

@@ -24,12 +24,32 @@ fn run_internal_command(commands: InternalCommands, ctx: impl Context) -> Result
 }
 
 fn run_public_command(commands: PublicCommands, ctx: impl Context) -> Result<()> {
-    if let PublicCommands::Rekey { paths } = commands {
-        return public::rekey(&ctx, paths);
+    match commands {
+        PublicCommands::Sign => {
+            let root = crate::git::Repository::workdir(ctx.repo());
+            let version = crate::policy::sign(root)?;
+            println!("signed policy v{version}: commit git-agecrypt.toml with it");
+            return Ok(());
+        }
+        PublicCommands::Verify { trust } => {
+            let root = crate::git::Repository::workdir(ctx.repo());
+            let trust = match trust {
+                Some(dir) => dir,
+                None => crate::policy::trust_dir()?,
+            };
+            let policy = crate::policy::Policy::read(root)?;
+            let signer = crate::policy::verify(&trust, &policy)?;
+            println!("policy v{} signed by {signer}", policy.version()?);
+            return Ok(());
+        }
+        PublicCommands::Rekey { paths } => return public::rekey(&ctx, paths),
+        _ => {}
     }
     let cmd = public::CommandContext::new(ctx);
     match commands {
-        PublicCommands::Rekey { .. } => unreachable!("handled above"),
+        PublicCommands::Sign | PublicCommands::Verify { .. } | PublicCommands::Rekey { .. } => {
+            unreachable!("handled above")
+        }
         PublicCommands::Init => {
             cmd.init()?;
         }

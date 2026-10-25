@@ -37,6 +37,16 @@ pub enum PublicCommands {
     /// Remove repository specific configuration
     Deinit,
 
+    /// Bump [policy] in git-agecrypt.toml and sign it with your git SSH signing key
+    Sign,
+
+    /// Check the signed policy against the trust anchor, changing nothing
+    Verify {
+        /// Directory holding allowed_signers (default: ~/.config/git-agecrypt)
+        #[arg(long)]
+        trust: Option<PathBuf>,
+    },
+
     /// Re-encrypt files to the recipients configured
     Rekey {
         /// Paths to rekey; all encrypted files when empty

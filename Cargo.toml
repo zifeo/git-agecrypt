@@ -30,6 +30,10 @@ thiserror = "2.0.18"
 toml = "1.1.2"
 toml_edit = "0.25.15"
 
+[target.'cfg(unix)'.dependencies]
+# getpwuid: the trust anchor's home comes from the account database.
+libc = "0.2"
+
 [features]
 
 [dev-dependencies]
