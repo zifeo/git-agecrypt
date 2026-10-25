@@ -506,7 +506,10 @@ ssh = """
   `<common gitdir>/git-agecrypt-policy.toml`: an older signed policy
   (rollback) and another repo's (foreign id) are refused by both. The first
   `on` of a clone trusts the newest policy it is shown (trust on first use).
-  While unlocked, clean refuses to encrypt once the policy differs from the pin.
+  While unlocked, clean refuses to encrypt once the policy differs from the pin
+  (or no longer parses). What git already holds still passes, so `reset` and
+  `status` keep working; an edited ring file stops them until `on` re-pins (or
+  the pinned policy comes back).
 - **Rings are whole directories.** Every ring pattern is `<dir>/**` and the toml
   keys are exactly those patterns, so every file type inside a ring is encrypted.
   `on` copies the ring lines into `.git/info/attributes`, which outranks any
@@ -533,6 +536,8 @@ ssh = """
   and CI. Paths travel through stdin, never argv. Needs a git that runs
   config-based hooks (`git hook list`): tested with 2.56, not in Debian 12's 2.39.
 - **Refresh.** `on` and `off` make stat stale and re-check-out, never delete;
+  `off` refuses ring files that are edited or untracked (ignored ones too), which
+  would stay plaintext;
   if `on` fails halfway (a blob no identity opens) the worktree goes back to
   locked with ciphertext everywhere. A re-pin turns files of a dropped ring
   back into ciphertext.

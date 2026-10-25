@@ -97,6 +97,12 @@ pub(crate) fn tracked(root: &Path, pathspecs: &[&str]) -> Result<Vec<String>> {
     nul_split(&checked(output(root, &args)?, &args)?)
 }
 
+/// Files git does not track, ignored ones included: plaintext all the same.
+pub(crate) fn untracked(root: &Path) -> Result<Vec<String>> {
+    let args = ["ls-files", "-z", "--full-name", "--others"];
+    nul_split(&checked(output(root, &args)?, &args)?)
+}
+
 /// Subset of `paths` whose filter attribute is git-agecrypt, in one git call.
 pub(crate) fn filtered(root: &Path, paths: &[String]) -> Result<HashSet<String>> {
     if paths.is_empty() {

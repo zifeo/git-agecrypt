@@ -48,6 +48,23 @@ fn on_refuses_uncommitted_ring_changes() {
 }
 
 #[test]
+fn off_refuses_untracked_ring_files_ignored_ones_included() {
+    let r = Repo::new();
+    r.on();
+    r.write("ring-a/new.txt", "never committed\n");
+    r.write("ring-b/ignored.txt", "ignored\n");
+    r.write(".gitignore", "ignored.txt\n");
+    let out = r.ac(&["off"]);
+    assert!(!out.status.success(), "off left plaintext behind");
+    for path in ["ring-a/new.txt", "ring-b/ignored.txt"] {
+        assert!(stderr(&out).contains(path), "{}", stderr(&out));
+    }
+    fs::remove_file(r.root.join("ring-a/new.txt")).unwrap();
+    fs::remove_file(r.root.join("ring-b/ignored.txt")).unwrap();
+    r.ac_ok(&["off"]);
+}
+
+#[test]
 fn unlock_stays_in_one_worktree_and_children_are_born_locked() {
     let r = Repo::new();
     let wt = r.outside("wt");
@@ -108,6 +125,48 @@ fn a_pulled_recipient_blocks_encryption_and_the_commit() {
     let check = r.ac(&["check", "--staged"]);
     assert!(!check.status.success());
     assert!(stderr(&check).contains("changed since git-agecrypt on"));
+}
+
+#[test]
+fn a_pulled_policy_keeps_reset_and_status_working() {
+    let r = Repo::new();
+    r.use_env_key();
+    ok(r.on_key(), "git-agecrypt on");
+    r.commit_secrets();
+    // B as a keyless pull leaves it: the index ciphertext on disk.
+    fs::remove_file(r.root.join(B)).unwrap();
+    r.git_ok(&["checkout", "--", B]);
+    assert!(r.read(B).starts_with(MAGIC));
+    r.add_unsigned_recipient("ring-a/**");
+    // Stale stat: git cleans both files again.
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    for rel in [A, B] {
+        fs::File::open(r.root.join(rel))
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+    }
+    r.git_ok(&["reset", "-q"]);
+    assert_eq!(
+        r.git_ok(&["status", "--porcelain"]),
+        " M git-agecrypt.toml\n"
+    );
+    // Nor does a policy that no longer parses stop them.
+    let toml = fs::read_to_string(r.root.join("git-agecrypt.toml")).unwrap();
+    r.write("git-agecrypt.toml", &format!("{toml}\n[after]\n"));
+    fs::File::open(r.root.join(A))
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+    r.git_ok(&["reset", "-q"]);
+    r.write(A, "new while the policy moved\n");
+    let add = r.git(&["add", A]);
+    assert!(!add.status.success(), "clean must still refuse to encrypt");
+    assert!(
+        stderr(&add).contains("refusing to encrypt"),
+        "{}",
+        stderr(&add)
+    );
 }
 
 #[test]

@@ -175,6 +175,21 @@ fn refuse_dirty(root: &Path, paths: &HashSet<String>, verb: &str) -> Result<()> 
     Ok(())
 }
 
+/// A ring file git never saw is not refreshed: it would stay plaintext.
+fn refuse_untracked(root: &Path, verb: &str) -> Result<()> {
+    let mut stray: Vec<String> = gitcli::filtered(root, &gitcli::untracked(root)?)?
+        .into_iter()
+        .collect();
+    if !stray.is_empty() {
+        stray.sort();
+        bail!(
+            "untracked files under encrypted paths stay plaintext; commit or remove them, then {verb}:\n{}",
+            stray.join("\n")
+        );
+    }
+    Ok(())
+}
+
 /// Re-check-out `paths` through the current filter. `git checkout` skips
 /// stat-clean files, so make their stat stale instead of deleting them: a
 /// checkout that fails halfway leaves the old content, not holes.
@@ -319,6 +334,7 @@ pub(crate) fn off<C: Context>(ctx: &C) -> Result<()> {
     let root = ctx.repo().workdir().to_path_buf();
     let paths = filtered_now(&root)?;
     refuse_dirty(&root, &paths, "off")?;
+    refuse_untracked(&root, "off")?;
     clear_unlock(&root, &gitdir(&root)?);
     refresh(&root, &paths)?;
     ensure_index_content(&root, &paths)?;

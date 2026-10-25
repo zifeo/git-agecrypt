@@ -100,9 +100,17 @@ impl<C: Context> CommandContext<C> {
     pub(crate) fn clean_bytes(&self, file: &Path, contents: Vec<u8>) -> Result<Vec<u8>> {
         log::info!("Encrypting file");
         let workdir = self.ctx.repo().workdir().to_path_buf();
-        if let Some(pinned) = self.ctx.pinned_policy()?
-            && policy::digest(&workdir)? != pinned
-        {
+        // A policy that no longer parses (a bad pull) has moved too.
+        let drifted = match self.ctx.pinned_policy()? {
+            Some(pinned) => policy::digest(&workdir).map_or(true, |d| d != pinned),
+            None => false,
+        };
+        if drifted {
+            // git re-cleans stat-dirty files on reset, status or stash: what git
+            // already holds goes back unchanged, nothing is encrypted anew.
+            if let Some(held) = self.held_ciphertext(&workdir.join(file), &contents)? {
+                return Ok(held);
+            }
             bail!(
                 "rings or recipients changed since git-agecrypt on: refusing to encrypt {}",
                 file.display()
@@ -154,6 +162,22 @@ impl<C: Context> CommandContext<C> {
         let res = age::encrypt(&recipients, &mut &contents[..])?;
         self.store(&file, hash, fp, res.clone())?;
         Ok(res)
+    }
+
+    /// A blob git holds for `contents`: the ciphertext itself, or the cached
+    /// ciphertext of unchanged plaintext.
+    fn held_ciphertext(&self, file: &Path, contents: &[u8]) -> Result<Option<Vec<u8>>> {
+        let repo = self.ctx.repo();
+        if contents.starts_with(age::MAGIC) {
+            return Ok(repo.has_blob(contents)?.then(|| contents.to_vec()));
+        }
+        let hash = *blake3::hash(contents).as_bytes();
+        Ok(match self.ctx.load_cache(file)? {
+            Some(e) if e.plaintext_hash == hash && repo.has_blob(&e.ciphertext)? => {
+                Some(e.ciphertext)
+            }
+            _ => None,
+        })
     }
 
     fn store(&self, file: &Path, hash: [u8; 32], fp: [u8; 32], ciphertext: Vec<u8>) -> Result<()> {
