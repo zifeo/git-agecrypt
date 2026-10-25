@@ -1,6 +1,7 @@
 use std::{
-    io::{self, ErrorKind as IoErrorKind, Read},
+    io::{self, ErrorKind as IoErrorKind, Read, Write},
     path::Path,
+    process::{Command, Stdio},
 };
 
 use age::{
@@ -67,9 +68,24 @@ pub(crate) fn decrypt_with(
     })
 }
 
+/// Go age 1.3 native post-quantum secret keys. The age crate cannot parse them
+/// until rage 0.13 (str4d/rage#632); `age-plugin-pq -identity` converts them to
+/// a plugin identity it can drive. Drop the conversion once rage 0.13 ships.
+const PQ_SECRET_PREFIX: &str = "AGE-SECRET-KEY-PQ-1";
+const PQ_PLUGIN: &str = "age-plugin-pq";
+
 /// Identities from the text an `identityCommand` printed (an identity file).
 pub(crate) fn identities_from_text(text: &str) -> Result<Vec<Box<dyn Identity>>> {
-    let ids = IdentityFile::from_buffer(io::Cursor::new(text.as_bytes()))
+    // Only the post-quantum lines go to age-plugin-pq: it rejects anything else.
+    let (pq, other): (Vec<&str>, Vec<&str>) = text
+        .lines()
+        .partition(|l| l.trim().to_ascii_uppercase().starts_with(PQ_SECRET_PREFIX));
+    let mut text = other.join("\n");
+    if !pq.is_empty() {
+        text.push('\n');
+        text.push_str(&pq_plugin_identity(&format!("{}\n", pq.join("\n")))?);
+    }
+    let ids = IdentityFile::from_buffer(io::Cursor::new(text.into_bytes()))
         .context("identityCommand output is not an age identity file")?
         .with_callbacks(NoCallbacks)
         .into_identities()
@@ -78,6 +94,29 @@ pub(crate) fn identities_from_text(text: &str) -> Result<Vec<Box<dyn Identity>>>
         bail!("identityCommand printed no identity");
     }
     Ok(ids)
+}
+
+fn pq_plugin_identity(text: &str) -> Result<String> {
+    let mut child = Command::new(PQ_PLUGIN)
+        .arg("-identity")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("{PQ_PLUGIN} is needed for post-quantum identities"))?;
+    child
+        .stdin
+        .take()
+        .context("no stdin for age-plugin-pq")?
+        .write_all(text.as_bytes())?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        bail!(
+            "{PQ_PLUGIN} -identity failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    String::from_utf8(out.stdout).context("age-plugin-pq output is not UTF-8")
 }
 
 pub(crate) fn load_identities(identities: &[impl AsRef<Path>]) -> Result<Vec<Box<dyn Identity>>> {
